@@ -134,6 +134,8 @@ class Transport:
     LOCAL_CLIENT_CACHE_MAXSIZE  = 512
 
     pending_local_path_requests = {}
+    incompatible_destinations   = {}
+    INCOMPATIBILITY_TIMEOUT     = 3600
 
     start_time                  = None
     jobs_locked                 = False
@@ -550,6 +552,17 @@ class Transport:
                     stale_links = []
                     for link_id in Transport.link_table:
                         link_entry = Transport.link_table[link_id]
+                        destination_hash = link_entry[IDX_LT_DSTHASH]
+                        
+                        if destination_hash in Transport.incompatible_destinations:
+                            incomp_info = Transport.incompatible_destinations[destination_hash]
+                            RNS.log(f"Link to {RNS.prettyhexrep(destination_hash)} failed due to: {incomp_info['reason']}", RNS.LOG_WARNING)
+                            Transport.expire_path(destination_hash)
+                            blocked_if = link_entry[IDX_LT_RCVD_IF]
+                            if not destination_hash in path_requests:
+                                path_requests[destination_hash] = blocked_if
+                            stale_links.append(link_id)
+                            continue
 
                         if link_entry[IDX_LT_VALIDATED] == True:
                             if time.time() > link_entry[IDX_LT_TIMESTAMP] + Transport.LINK_TIMEOUT:
@@ -749,6 +762,21 @@ class Transport:
                     if i > 0:
                         if i == 1: RNS.log("Removed "+str(i)+" path state entry", RNS.LOG_EXTREME)
                         else: RNS.log("Removed "+str(i)+" path state entries", RNS.LOG_EXTREME)
+
+                    stale_incompatibilities = []
+                    for destination_hash in Transport.incompatible_destinations:
+                        entry = Transport.incompatible_destinations[destination_hash]
+                        if time.time() - entry["timestamp"] > Transport.INCOMPATIBILITY_TIMEOUT:
+                            stale_incompatibilities.append(destination_hash)
+                    
+                    i = 0
+                    for destination_hash in stale_incompatibilities:
+                        Transport.incompatible_destinations.pop(destination_hash)
+                        i += 1
+                    
+                    if i > 0:
+                        if i == 1: RNS.log("Removed "+str(i)+" incompatibility record", RNS.LOG_DEBUG)
+                        else: RNS.log("Removed "+str(i)+" incompatibility records", RNS.LOG_DEBUG)
 
                     Transport.tables_last_culled = time.time()
 
@@ -1367,6 +1395,12 @@ class Transport:
                                 
                                 path_mtu       = RNS.Link.mtu_from_lr_packet(packet)
                                 mode           = RNS.Link.mode_from_lr_packet(packet)
+                                
+                                if mode not in RNS.Link.ENABLED_MODES:
+                                    RNS.log(f"Dropping link request with incompatible mode {RNS.Link.MODE_DESCRIPTIONS.get(mode, mode)}", RNS.LOG_WARNING)
+                                    Transport.jobs_locked = False
+                                    return
+                                
                                 nh_mtu         = outbound_interface.HW_MTU
                                 if path_mtu:
                                     if outbound_interface.HW_MTU == None:
@@ -1388,16 +1422,16 @@ class Transport:
                                                 RNS.log(f"Dropping link request packet. The contained exception was: {e}", RNS.LOG_WARNING)
                                                 return
 
-                                # Entry format is
-                                link_entry = [  now,                            # 0: Timestamp,
-                                                next_hop,                       # 1: Next-hop transport ID
-                                                outbound_interface,             # 2: Next-hop interface
-                                                remaining_hops,                 # 3: Remaining hops
-                                                packet.receiving_interface,     # 4: Received on interface
-                                                packet.hops,                    # 5: Taken hops
-                                                packet.destination_hash,        # 6: Original destination hash
-                                                False,                          # 7: Validated
-                                                proof_timeout]                  # 8: Proof timeout timestamp
+                                link_entry = [  now,
+                                                next_hop,
+                                                outbound_interface,
+                                                remaining_hops,
+                                                packet.receiving_interface,
+                                                packet.hops,
+                                                packet.destination_hash,
+                                                False,
+                                                proof_timeout,
+                                                mode]
 
                                 Transport.link_table[RNS.Link.link_id_from_lr_packet(packet)] = link_entry
 
@@ -1839,6 +1873,11 @@ class Transport:
                         if destination.hash == packet.destination_hash and destination.type == packet.destination_type:
                             path_mtu       = RNS.Link.mtu_from_lr_packet(packet)
                             mode           = RNS.Link.mode_from_lr_packet(packet)
+                            
+                            if mode not in RNS.Link.ENABLED_MODES:
+                                RNS.log(f"Ignoring link request to local destination with incompatible mode {RNS.Link.MODE_DESCRIPTIONS.get(mode, mode)}", RNS.LOG_WARNING)
+                                Transport.jobs_locked = False
+                                return
                             if packet.receiving_interface.AUTOCONFIGURE_MTU or packet.receiving_interface.FIXED_MTU:
                                 nh_mtu     = packet.receiving_interface.HW_MTU
                             else:
@@ -2413,6 +2452,37 @@ class Transport:
                 return True
 
         return False
+
+    @staticmethod
+    def mark_destination_incompatible(destination_hash, reason, remote_mode=None, local_mode=None):
+        incompatibility_entry = {
+            "reason": reason,
+            "timestamp": time.time(),
+            "remote_mode": remote_mode,
+            "local_mode": local_mode
+        }
+        
+        Transport.incompatible_destinations[destination_hash] = incompatibility_entry
+        Transport.mark_path_unresponsive(destination_hash)
+        
+        mode_desc_remote = RNS.Link.MODE_DESCRIPTIONS.get(remote_mode, f"Unknown({remote_mode})")
+        mode_desc_local = RNS.Link.MODE_DESCRIPTIONS.get(local_mode, f"Unknown({local_mode})")
+        
+        RNS.log(f"Marked {RNS.prettyhexrep(destination_hash)} as incompatible: {reason}", RNS.LOG_WARNING)
+        RNS.log(f"Remote mode: {mode_desc_remote}, Local mode: {mode_desc_local}", RNS.LOG_WARNING)
+        
+        return True
+
+    @staticmethod
+    def is_destination_incompatible(destination_hash):
+        if destination_hash in Transport.incompatible_destinations:
+            entry = Transport.incompatible_destinations[destination_hash]
+            if time.time() - entry["timestamp"] < Transport.INCOMPATIBILITY_TIMEOUT:
+                return entry
+            else:
+                Transport.incompatible_destinations.pop(destination_hash)
+        
+        return None
 
     @staticmethod
     def request_path(destination_hash, on_interface=None, tag=None, recursive=False):
@@ -3059,6 +3129,7 @@ IDX_LT_HOPS      = 5
 IDX_LT_DSTHASH   = 6
 IDX_LT_VALIDATED = 7
 IDX_LT_PROOF_TMO = 8
+IDX_LT_MODE      = 9
 
 # Transport.tunnels entry indices
 IDX_TT_TUNNEL_ID = 0

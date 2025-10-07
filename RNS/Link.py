@@ -400,7 +400,16 @@ class Link:
                 confirmed_mtu = None
                 mode = Link.mode_from_lp_packet(packet)
                 RNS.log(f"Validating link request proof with mode {Link.MODE_DESCRIPTIONS[mode]}", RNS.LOG_DEBUG) # TODO: Remove debug
-                if mode != self.mode: raise TypeError(f"Invalid link mode {mode} in link request proof")
+                if mode != self.mode:
+                    if self.destination:
+                        RNS.Transport.mark_destination_incompatible(
+                            self.destination.hash,
+                            reason="crypto_mode_mismatch",
+                            remote_mode=mode,
+                            local_mode=self.mode
+                        )
+                        self.incompatibility_reason = f"Crypto mode mismatch: remote={Link.MODE_DESCRIPTIONS.get(mode, mode)}, local={Link.MODE_DESCRIPTIONS.get(self.mode, self.mode)}"
+                    raise TypeError(f"Invalid link mode {mode} in link request proof")
                 if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
                     confirmed_mtu = Link.mtu_from_lp_packet(packet)
                     signalling_bytes = Link.signalling_bytes(confirmed_mtu, mode)
@@ -686,6 +695,14 @@ class Link:
         """
         return self.__remote_identity
 
+    def get_incompatibility_reason(self):
+        """
+        :returns: The reason for incompatibility if this link failed due to crypto mode mismatch, otherwise ``None``.
+        """
+        if hasattr(self, 'incompatibility_reason'):
+            return self.incompatibility_reason
+        return None
+
     def had_outbound(self, is_keepalive=False):
         self.last_outbound = time.time()
         if not is_keepalive: self.last_data = self.last_outbound
@@ -739,6 +756,9 @@ class Link:
             if self.destination.direction == RNS.Destination.IN:
                 if self in self.destination.links:
                     self.destination.links.remove(self)
+
+        if hasattr(self, 'incompatibility_reason'):
+            RNS.log(f"Link {str(self)} closed due to incompatibility: {self.incompatibility_reason}", RNS.LOG_WARNING)
 
         if self.callbacks.link_closed != None:
             try:
