@@ -117,6 +117,13 @@ class Transport:
     discovery_pr_tags           = []           # A table for keeping track of tagged path requests
     max_pr_tags                 = 32000        # Maximum amount of unique path request tags to remember
 
+    # Path diversity for privacy-preserving routing
+    alternative_paths           = {}           # A table for storing alternative paths to destinations
+    path_diversity_enabled      = True        # Enable random path routing for privacy
+    path_selection_strategy     = "weighted_random"  # Strategy: "random", "weighted_random", "round_robin"
+    max_alternative_paths       = 5            # Maximum alternative paths to store per destination
+    path_hop_tolerance          = 3            # Store paths within this many hops of the best path
+
     # Transport control destinations are used
     # for control purposes like path requests
     control_destinations        = []
@@ -329,6 +336,10 @@ class Transport:
                 RNS.log("Transport Instance will respond to probe requests on "+str(Transport.probe_destination), RNS.LOG_NOTICE)
             else:
                 Transport.probe_destination = None
+
+            # Log path diversity status at startup
+            if Transport.path_diversity_enabled:
+                RNS.log(f"Privacy routing enabled: strategy={Transport.path_selection_strategy}, max_paths={Transport.max_alternative_paths}, hop_tolerance={Transport.path_hop_tolerance}", RNS.LOG_INFO)
 
             RNS.log("Transport instance "+str(Transport.identity)+" started", RNS.LOG_VERBOSE)
             Transport.start_time = time.time()
@@ -665,6 +676,31 @@ class Transport:
                             should_collect = True
                             RNS.log("Path to "+RNS.prettyhexrep(destination_hash)+" was removed since the attached interface no longer exists", RNS.LOG_DEBUG)
 
+                    # Cull alternative paths for path diversity
+                    if Transport.path_diversity_enabled:
+                        stale_alternative_dests = []
+                        for destination_hash in list(Transport.alternative_paths.keys()):
+                            # Remove alternative paths for destinations no longer in primary table
+                            if destination_hash not in Transport.path_table:
+                                stale_alternative_dests.append(destination_hash)
+                                continue
+                            
+                            # Clean up expired alternative paths
+                            valid_alternatives = []
+                            for alt_path in Transport.alternative_paths[destination_hash]:
+                                if time.time() < alt_path[IDX_PT_EXPIRES] and \
+                                   alt_path[IDX_PT_RVCD_IF] in Transport.interfaces:
+                                    valid_alternatives.append(alt_path)
+                            
+                            if len(valid_alternatives) == 0:
+                                stale_alternative_dests.append(destination_hash)
+                            else:
+                                Transport.alternative_paths[destination_hash] = valid_alternatives
+                        
+                        for destination_hash in stale_alternative_dests:
+                            Transport.alternative_paths.pop(destination_hash)
+                            should_collect = True
+
                     # Cull the pending discovery path requests table
                     stale_discovery_path_requests = []
                     for destination_hash in Transport.discovery_path_requests:
@@ -900,20 +936,27 @@ class Transport:
 
         # Check if we have a known path for the destination in the path table
         if packet.packet_type != RNS.Packet.ANNOUNCE and packet.destination.type != RNS.Destination.PLAIN and packet.destination.type != RNS.Destination.GROUP and packet.destination_hash in Transport.path_table:
-            outbound_interface = Transport.path_table[packet.destination_hash][IDX_PT_RVCD_IF]
+            # Use path selection method for privacy-preserving routing
+            next_hop, outbound_interface, hops = Transport.select_outbound_path(packet.destination_hash)
+            
+            if next_hop is None or outbound_interface is None:
+                # Fallback to primary path if selection failed
+                outbound_interface = Transport.path_table[packet.destination_hash][IDX_PT_RVCD_IF]
+                next_hop = Transport.path_table[packet.destination_hash][IDX_PT_NEXT_HOP]
+                hops = Transport.path_table[packet.destination_hash][IDX_PT_HOPS]
 
             # If there's more than one hop to the destination, and we know
             # a path, we insert the packet into transport by adding the next
             # transport nodes address to the header, and modifying the flags.
             # This rule applies both for "normal" transport, and when connected
             # to a local shared Reticulum instance.
-            if Transport.path_table[packet.destination_hash][IDX_PT_HOPS] > 1:
+            if hops > 1:
                 if packet.header_type == RNS.Packet.HEADER_1:
                     # Insert packet into transport
                     new_flags = (RNS.Packet.HEADER_2) << 6 | (Transport.TRANSPORT) << 4 | (packet.flags & 0b00001111)
                     new_raw = struct.pack("!B", new_flags)
                     new_raw += packet.raw[1:2]
-                    new_raw += Transport.path_table[packet.destination_hash][IDX_PT_NEXT_HOP]
+                    new_raw += next_hop
                     new_raw += packet.raw[2:]
                     packet_sent(packet)
                     Transport.transmit(outbound_interface, new_raw)
@@ -927,13 +970,13 @@ class Transport:
             # one hop away would just be broadcast directly, but since we
             # are "behind" a shared instance, we need to get that instance
             # to transport it onto the network.
-            elif Transport.path_table[packet.destination_hash][IDX_PT_HOPS] == 1 and Transport.owner.is_connected_to_shared_instance:
+            elif hops == 1 and Transport.owner.is_connected_to_shared_instance:
                 if packet.header_type == RNS.Packet.HEADER_1:
                     # Insert packet into transport
                     new_flags = (RNS.Packet.HEADER_2) << 6 | (Transport.TRANSPORT) << 4 | (packet.flags & 0b00001111)
                     new_raw = struct.pack("!B", new_flags)
                     new_raw += packet.raw[1:2]
-                    new_raw += Transport.path_table[packet.destination_hash][IDX_PT_NEXT_HOP]
+                    new_raw += next_hop
                     new_raw += packet.raw[2:]
                     packet_sent(packet)
                     Transport.transmit(outbound_interface, new_raw)
@@ -1808,8 +1851,59 @@ class Transport:
 
                             if not Transport.owner.is_connected_to_shared_instance: Transport.cache(packet, force_cache=True, packet_type="announce")
                             path_table_entry = [now, received_from, announce_hops, expires, random_blobs, packet.receiving_interface, packet.packet_hash]
-                            Transport.path_table[packet.destination_hash] = path_table_entry
-                            RNS.log("Destination "+RNS.prettyhexrep(packet.destination_hash)+" is now "+str(announce_hops)+" hops away via "+RNS.prettyhexrep(received_from)+" on "+str(packet.receiving_interface), RNS.LOG_DEBUG)
+                            
+                            # Handle path diversity for privacy-preserving routing
+                            destination_hash = packet.destination_hash
+                            if Transport.path_diversity_enabled:
+                                if destination_hash in Transport.path_table:
+                                    existing_path = Transport.path_table[destination_hash]
+                                    existing_hops = existing_path[IDX_PT_HOPS]
+                                    
+                                    if announce_hops <= existing_hops:
+                                        # New path is better or equal - store old one as alternative if different
+                                        if existing_path[IDX_PT_NEXT_HOP] != received_from:
+                                            if destination_hash not in Transport.alternative_paths:
+                                                Transport.alternative_paths[destination_hash] = []
+                                            
+                                            # Add old primary path to alternatives
+                                            Transport.alternative_paths[destination_hash].append(existing_path)
+                                            
+                                            # Sort by hop count and keep only best alternatives
+                                            Transport.alternative_paths[destination_hash].sort(key=lambda p: p[IDX_PT_HOPS])
+                                            Transport.alternative_paths[destination_hash] = \
+                                                Transport.alternative_paths[destination_hash][:Transport.max_alternative_paths]
+                                        
+                                        # Install new path as primary
+                                        Transport.path_table[destination_hash] = path_table_entry
+                                        RNS.log("Destination "+RNS.prettyhexrep(destination_hash)+" is now "+str(announce_hops)+" hops away via "+RNS.prettyhexrep(received_from)+" on "+str(packet.receiving_interface), RNS.LOG_DEBUG)
+                                    
+                                    elif announce_hops <= existing_hops + Transport.path_hop_tolerance:
+                                        # Suboptimal but within tolerance - store as alternative if different path
+                                        if received_from != existing_path[IDX_PT_NEXT_HOP]:
+                                            if destination_hash not in Transport.alternative_paths:
+                                                Transport.alternative_paths[destination_hash] = []
+                                            
+                                            # Check if this path is already stored
+                                            already_stored = False
+                                            for alt_path in Transport.alternative_paths[destination_hash]:
+                                                if alt_path[IDX_PT_NEXT_HOP] == received_from:
+                                                    already_stored = True
+                                                    break
+                                            
+                                            if not already_stored and \
+                                               len(Transport.alternative_paths[destination_hash]) < Transport.max_alternative_paths:
+                                                Transport.alternative_paths[destination_hash].append(path_table_entry)
+                                                Transport.alternative_paths[destination_hash].sort(key=lambda p: p[IDX_PT_HOPS])
+                                                RNS.log("Stored alternative path to "+RNS.prettyhexrep(destination_hash)+" at "+str(announce_hops)+" hops via "+RNS.prettyhexrep(received_from), RNS.LOG_DEBUG)
+                                    
+                                else:
+                                    # First path for this destination
+                                    Transport.path_table[destination_hash] = path_table_entry
+                                    RNS.log("Destination "+RNS.prettyhexrep(destination_hash)+" is now "+str(announce_hops)+" hops away via "+RNS.prettyhexrep(received_from)+" on "+str(packet.receiving_interface), RNS.LOG_DEBUG)
+                            else:
+                                # Path diversity disabled - use default behavior
+                                Transport.path_table[destination_hash] = path_table_entry
+                                RNS.log("Destination "+RNS.prettyhexrep(destination_hash)+" is now "+str(announce_hops)+" hops away via "+RNS.prettyhexrep(received_from)+" on "+str(packet.receiving_interface), RNS.LOG_DEBUG)
 
                             # If the receiving interface is a tunnel, we add the
                             # announce to the tunnels table
@@ -2390,6 +2484,105 @@ class Transport:
             return None
 
     @staticmethod
+    def select_outbound_path(destination_hash):
+        """
+        Select a path for outbound routing based on configured strategy.
+        Provides privacy-preserving random path routing when enabled.
+        
+        :param destination_hash: The destination to route to
+        :returns: Tuple of (next_hop, outbound_interface, hops)
+        """
+        if destination_hash not in Transport.path_table:
+            return (None, None, None)
+        
+        primary_path = Transport.path_table[destination_hash]
+        
+        # If path diversity is disabled or no alternatives exist, use primary path
+        if not Transport.path_diversity_enabled or \
+           destination_hash not in Transport.alternative_paths or \
+           len(Transport.alternative_paths[destination_hash]) == 0:
+            return (primary_path[IDX_PT_NEXT_HOP], 
+                   primary_path[IDX_PT_RVCD_IF], 
+                   primary_path[IDX_PT_HOPS])
+        
+        # Build candidate pool: primary + valid alternatives
+        candidates = [primary_path]
+        now = time.time()
+        
+        # Filter out expired alternative paths
+        valid_alternatives = []
+        for alt_path in Transport.alternative_paths[destination_hash]:
+            if now < alt_path[IDX_PT_EXPIRES]:
+                valid_alternatives.append(alt_path)
+        
+        # Update alternative paths list to remove expired ones
+        if len(valid_alternatives) != len(Transport.alternative_paths[destination_hash]):
+            Transport.alternative_paths[destination_hash] = valid_alternatives
+        
+        candidates.extend(valid_alternatives)
+        
+        if len(candidates) == 1:
+            # Only primary path available
+            return (primary_path[IDX_PT_NEXT_HOP], 
+                   primary_path[IDX_PT_RVCD_IF], 
+                   primary_path[IDX_PT_HOPS])
+        
+        # Select path based on strategy
+        selected_path = None
+        
+        if Transport.path_selection_strategy == "random":
+            # Pure random selection - maximum privacy, variable latency
+            import random
+            selected_path = random.choice(candidates)
+            
+        elif Transport.path_selection_strategy == "weighted_random":
+            # Weighted random - favor shorter paths but still use alternatives
+            # Weight calculation: 1/(hops+1)^2 to strongly favor shorter paths
+            # but still give alternatives a chance
+            weights = []
+            for path in candidates:
+                hops = path[IDX_PT_HOPS]
+                weight = 1.0 / ((hops + 1) ** 2)
+                weights.append(weight)
+            
+            total_weight = sum(weights)
+            
+            # Use cryptographic randomness from RNS
+            rand_bytes = RNS.Identity.get_random_hash()[:2]
+            rand_val = int.from_bytes(rand_bytes, "big") / 65536.0
+            
+            cumulative = 0.0
+            for i, weight in enumerate(weights):
+                cumulative += weight / total_weight
+                if rand_val <= cumulative:
+                    selected_path = candidates[i]
+                    break
+            
+            # Fallback to last candidate if rounding issues
+            if selected_path is None:
+                selected_path = candidates[-1]
+                
+        elif Transport.path_selection_strategy == "round_robin":
+            # Round-robin through available paths - deterministic but variable
+            if not hasattr(Transport, 'path_selection_counter'):
+                Transport.path_selection_counter = {}
+            
+            if destination_hash not in Transport.path_selection_counter:
+                Transport.path_selection_counter[destination_hash] = 0
+            
+            idx = Transport.path_selection_counter[destination_hash] % len(candidates)
+            Transport.path_selection_counter[destination_hash] += 1
+            selected_path = candidates[idx]
+        
+        else:
+            # Unknown strategy, use primary path
+            selected_path = primary_path
+        
+        return (selected_path[IDX_PT_NEXT_HOP], 
+               selected_path[IDX_PT_RVCD_IF], 
+               selected_path[IDX_PT_HOPS])
+
+    @staticmethod
     def next_hop_per_bit_latency(destination_hash):
         next_hop_interface_bitrate = Transport.next_hop_interface_bitrate(destination_hash)
         if next_hop_interface_bitrate != None: return (1/next_hop_interface_bitrate)
@@ -2483,6 +2676,61 @@ class Transport:
                 Transport.incompatible_destinations.pop(destination_hash)
         
         return None
+
+    @staticmethod
+    def enable_path_diversity(strategy="weighted_random", max_paths=3, hop_tolerance=3):
+        """
+        Enable privacy-preserving random path routing.
+        
+        This feature provides resistance to traffic analysis and network surveillance
+        by maintaining and randomly selecting from multiple paths to each destination.
+        This is completely backwards compatible - it only affects local routing decisions.
+        
+        :param strategy: Path selection strategy. Options:
+                        - "random": Pure random selection (maximum privacy, variable latency)
+                        - "weighted_random": Favor shorter paths but use alternatives (default, balanced)
+                        - "round_robin": Cycle through paths deterministically (less privacy)
+        :param max_paths: Maximum number of alternative paths to maintain per destination (default: 3)
+        :param hop_tolerance: Store alternative paths within this many hops of the best path (default: 3)
+        """
+        valid_strategies = ["random", "weighted_random", "round_robin"]
+        if strategy not in valid_strategies:
+            raise ValueError(f"Invalid strategy '{strategy}'. Must be one of: {valid_strategies}")
+        
+        Transport.path_diversity_enabled = True
+        Transport.path_selection_strategy = strategy
+        Transport.max_alternative_paths = max(1, min(max_paths, 10))  # Clamp between 1-10
+        Transport.path_hop_tolerance = max(1, min(hop_tolerance, 10))  # Clamp between 1-10
+        
+        RNS.log(f"Path diversity enabled with strategy '{strategy}', max_paths={Transport.max_alternative_paths}, hop_tolerance={Transport.path_hop_tolerance}", RNS.LOG_INFO)
+
+    @staticmethod
+    def disable_path_diversity():
+        """
+        Disable privacy-preserving random path routing and use only shortest paths.
+        """
+        Transport.path_diversity_enabled = False
+        Transport.alternative_paths.clear()
+        RNS.log("Path diversity disabled", RNS.LOG_INFO)
+
+    @staticmethod
+    def get_path_diversity_status():
+        """
+        Get the current path diversity configuration.
+        
+        :returns: Dictionary with configuration details or None if disabled
+        """
+        if not Transport.path_diversity_enabled:
+            return None
+        
+        return {
+            "enabled": True,
+            "strategy": Transport.path_selection_strategy,
+            "max_paths": Transport.max_alternative_paths,
+            "hop_tolerance": Transport.path_hop_tolerance,
+            "stored_alternatives": len(Transport.alternative_paths),
+            "total_alternative_paths": sum(len(paths) for paths in Transport.alternative_paths.values())
+        }
 
     @staticmethod
     def request_path(destination_hash, on_interface=None, tag=None, recursive=False):
