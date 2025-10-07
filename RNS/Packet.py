@@ -32,6 +32,7 @@ import threading
 import struct
 import math
 import time
+import random
 import RNS
 
 class Packet:
@@ -114,13 +115,18 @@ class Packet:
 
     TIMEOUT_PER_HOP = RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT
 
+    HOP_OBFUSCATION_ENABLED = True
+    HOP_OBFUSCATION_MIN = 0
+    HOP_OBFUSCATION_MAX = 3
+
     __slots__  = "hops", "header", "header_type", "packet_type", "transport_type", "context", "context_flag", "destination"
     __slots__ += "transport_id", "data", "flags", "raw", "packed", "sent", "create_receipt", "receipt", "fromPacked", "MTU"
     __slots__ += "sent_at", "packet_hash", "ratchet_id", "attached_interface", "receiving_interface", "rssi", "snr", "q"
     __slots__ += "ciphertext", "plaintext", "destination_hash", "destination_type", "link", "map_hash"
 
     def __init__(self, destination, data, packet_type = DATA, context = NONE, transport_type = RNS.Transport.BROADCAST,
-                 header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET):
+                 header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET,
+                 initial_hops = None):
 
         if destination != None:
             if transport_type == None:
@@ -132,7 +138,13 @@ class Packet:
             self.context        = context
             self.context_flag   = context_flag
 
-            self.hops           = 0;
+            if initial_hops is not None:
+                self.hops = initial_hops
+            elif Packet.HOP_OBFUSCATION_ENABLED and packet_type == Packet.DATA:
+                self.hops = random.randint(Packet.HOP_OBFUSCATION_MIN, Packet.HOP_OBFUSCATION_MAX)
+            else:
+                self.hops = 0
+            
             self.destination    = destination
             self.transport_id   = transport_id
             self.data           = data
