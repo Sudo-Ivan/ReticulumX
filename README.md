@@ -12,6 +12,12 @@ pip install git+https://github.com/Sudo-Ivan/ReticulumX.git --break-system-packa
 pipx install git+https://github.com/Sudo-Ivan/ReticulumX.git --force
 ```
 
+## Features
+
+- Crypto mode incompatibility handling (detecting and avoiding old AES-128 links/paths)
+- Privacy routing (round robin, weighted random, pure random)
+- Hop count obfuscation
+
 ==========
 
 
