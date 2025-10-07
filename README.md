@@ -1,3 +1,20 @@
+# ReticulumX 
+
+Custom fork with experimental features, backwards comptabile changes and other fun stuff.
+
+## Installation
+
+```bash
+pip install git+https://github.com/Sudo-Ivan/ReticulumX.git --break-system-packages
+
+# or 
+
+pipx install git+https://github.com/Sudo-Ivan/ReticulumX.git --force
+```
+
+==========
+
+
 Reticulum Network Stack <img align="right" src="https://static.pepy.tech/personalized-badge/rns?period=month&units=international_system&left_color=grey&right_color=blue&left_text=Installs/month" style="padding-left:10px"/><a href="https://github.com/markqvist/Reticulum/actions/workflows/build.yml"><img align="right" src="https://github.com/markqvist/Reticulum/actions/workflows/build.yml/badge.svg"/></a>
 ==========
 
